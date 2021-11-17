@@ -1,65 +1,36 @@
-use crate::ast::Span;
+use crate::ast::{Span, Spanned};
 use crate::collections::HashMap;
-use crate::compile::v1::Assembler;
-use crate::compile::{Assembly, CompileError, CompileErrorKind, CompileResult, CompileVisitor};
-use crate::runtime::Inst;
+use crate::compile::{CompileError, CompileErrorKind, CompileResult, CompileVisitor};
 use crate::SourceId;
+use std::fmt;
 
-/// A locally declared variable, its calculated stack offset and where it was
-/// declared in its source file.
-#[derive(Debug, Clone, Copy)]
-pub struct Var {
-    /// Slot offset from the current stack frame.
-    pub(crate) offset: usize,
-    /// Token assocaited with the variable.
-    span: Span,
-    /// Variable has been taken at the given position.
-    moved_at: Option<Span>,
-}
+pub(crate) trait Variable: fmt::Debug + Copy + Spanned {
+    /// Construct a new variable at the given offset.
+    fn new(offset: usize, span: Span) -> Self;
 
-impl Var {
-    /// Copy the declared variable.
-    pub(crate) fn copy<C>(&self, c: &mut Assembler<'_>, span: Span, comment: C)
-    where
-        C: AsRef<str>,
-    {
-        c.asm.push_with_comment(
-            Inst::Copy {
-                offset: self.offset,
-            },
-            span,
-            comment,
-        );
-    }
+    /// Get the span where the variable was moved.
+    fn moved_at(&self) -> Option<Span>;
 
-    /// Move the declared variable.
-    pub(crate) fn do_move<C>(&self, asm: &mut Assembly, span: Span, comment: C)
-    where
-        C: AsRef<str>,
-    {
-        asm.push_with_comment(
-            Inst::Move {
-                offset: self.offset,
-            },
-            span,
-            comment,
-        );
-    }
+    /// Mark the variable as moved. Returns `None` if the variable wasn't already moved.
+    fn mark_as_moved(&mut self, span: Span) -> Option<Span>;
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Scope {
+pub(crate) struct Scope<T> {
     /// Named variables.
-    locals: HashMap<String, Var>,
+    locals: HashMap<String, T>,
     /// The number of variables.
     pub(crate) total_var_count: usize,
     /// The number of variables local to this scope.
     pub(crate) local_var_count: usize,
 }
 
-impl Scope {
+impl<T> Scope<T>
+where
+    T: Variable,
+{
     /// Construct a new locals handlers.
-    fn new() -> Scope {
+    fn new() -> Self {
         Self {
             locals: HashMap::new(),
             total_var_count: 0,
@@ -80,11 +51,7 @@ impl Scope {
     fn new_var(&mut self, name: &str, span: Span) -> CompileResult<usize> {
         let offset = self.total_var_count;
 
-        let local = Var {
-            offset,
-            span,
-            moved_at: None,
-        };
+        let local = T::new(offset, span);
 
         self.total_var_count += 1;
         self.local_var_count += 1;
@@ -94,7 +61,7 @@ impl Scope {
                 span,
                 CompileErrorKind::VariableConflict {
                     name: name.to_owned(),
-                    existing_span: old.span,
+                    existing_span: old.span(),
                 },
             ));
         }
@@ -108,14 +75,7 @@ impl Scope {
 
         log::trace!("decl {} => {}", name, offset);
 
-        self.locals.insert(
-            name.to_owned(),
-            Var {
-                offset,
-                span,
-                moved_at: None,
-            },
-        );
+        self.locals.insert(name.to_owned(), T::new(offset, span));
 
         self.total_var_count += 1;
         self.local_var_count += 1;
@@ -148,9 +108,9 @@ impl Scope {
     }
 
     /// Access the variable with the given name.
-    fn get(&self, name: &str, span: Span) -> CompileResult<Option<Var>> {
+    fn get(&self, name: &str, span: Span) -> CompileResult<Option<T>> {
         if let Some(var) = self.locals.get(name) {
-            if let Some(moved_at) = var.moved_at {
+            if let Some(moved_at) = var.moved_at() {
                 return Err(CompileError::new(
                     span,
                     CompileErrorKind::VariableMoved { moved_at },
@@ -164,17 +124,16 @@ impl Scope {
     }
 
     /// Access the variable with the given name.
-    fn take(&mut self, name: &str, span: Span) -> CompileResult<Option<&Var>> {
+    fn take(&mut self, name: &str, span: Span) -> CompileResult<Option<T>> {
         if let Some(var) = self.locals.get_mut(name) {
-            if let Some(moved_at) = var.moved_at {
+            if let Some(moved_at) = var.mark_as_moved(span) {
                 return Err(CompileError::new(
                     span,
                     CompileErrorKind::VariableMoved { moved_at },
                 ));
             }
 
-            var.moved_at = Some(span);
-            return Ok(Some(var));
+            return Ok(Some(*var));
         }
 
         Ok(None)
@@ -188,11 +147,14 @@ impl Scope {
 #[must_use]
 pub(crate) struct ScopeGuard(usize);
 
-pub(crate) struct Scopes {
-    scopes: Vec<Scope>,
+pub(crate) struct Scopes<T> {
+    scopes: Vec<Scope<T>>,
 }
 
-impl Scopes {
+impl<T> Scopes<T>
+where
+    T: Variable,
+{
     /// Construct a new collection of scopes.
     pub(crate) fn new() -> Self {
         Self {
@@ -208,13 +170,13 @@ impl Scopes {
         name: &str,
         source_id: SourceId,
         span: Span,
-    ) -> CompileResult<Option<Var>> {
+    ) -> CompileResult<Option<T>> {
         log::trace!("get var: {}", name);
 
         for scope in self.scopes.iter().rev() {
             if let Some(var) = scope.get(name, span)? {
                 log::trace!("found var: {} => {:?}", name, var);
-                visitor.visit_variable_use(source_id, var.span, span);
+                visitor.visit_variable_use(source_id, var.span(), span);
                 return Ok(Some(var));
             }
         }
@@ -230,13 +192,13 @@ impl Scopes {
         name: &str,
         source_id: SourceId,
         span: Span,
-    ) -> CompileResult<Option<&Var>> {
+    ) -> CompileResult<Option<T>> {
         log::trace!("get var: {}", name);
 
         for scope in self.scopes.iter_mut().rev() {
             if let Some(var) = scope.take(name, span)? {
                 log::trace!("found var: {} => {:?}", name, var);
-                visitor.visit_variable_use(source_id, var.span, span);
+                visitor.visit_variable_use(source_id, var.span(), span);
                 return Ok(Some(var));
             }
         }
@@ -251,7 +213,7 @@ impl Scopes {
         name: &str,
         source_id: SourceId,
         span: Span,
-    ) -> CompileResult<Var> {
+    ) -> CompileResult<T> {
         match self.try_get_var(visitor, name, source_id, span)? {
             Some(var) => Ok(var),
             None => Err(CompileError::new(
@@ -270,7 +232,7 @@ impl Scopes {
         name: &str,
         source_id: SourceId,
         span: Span,
-    ) -> CompileResult<&Var> {
+    ) -> CompileResult<T> {
         match self.try_take_var(visitor, name, source_id, span)? {
             Some(var) => Ok(var),
             None => Err(CompileError::new(
@@ -303,13 +265,13 @@ impl Scopes {
     }
 
     /// Push a scope and return an index.
-    pub(crate) fn push(&mut self, scope: Scope) -> ScopeGuard {
+    pub(crate) fn push(&mut self, scope: Scope<T>) -> ScopeGuard {
         self.scopes.push(scope);
         ScopeGuard(self.scopes.len())
     }
 
     /// Pop the last scope and compare with the expected length.
-    pub(crate) fn pop(&mut self, expected: ScopeGuard, span: Span) -> CompileResult<Scope> {
+    pub(crate) fn pop(&mut self, expected: ScopeGuard, span: Span) -> CompileResult<Scope<T>> {
         let ScopeGuard(expected) = expected;
 
         if self.scopes.len() != expected {
@@ -323,12 +285,12 @@ impl Scopes {
     }
 
     /// Pop the last of the scope.
-    pub(crate) fn pop_last(&mut self, span: Span) -> CompileResult<Scope> {
+    pub(crate) fn pop_last(&mut self, span: Span) -> CompileResult<Scope<T>> {
         self.pop(ScopeGuard(1), span)
     }
 
     /// Pop the last scope and compare with the expected length.
-    pub(crate) fn pop_unchecked(&mut self, span: Span) -> CompileResult<Scope> {
+    pub(crate) fn pop_unchecked(&mut self, span: Span) -> CompileResult<Scope<T>> {
         let scope = self
             .scopes
             .pop()
@@ -344,7 +306,7 @@ impl Scopes {
     }
 
     /// Construct a new child scope.
-    pub(crate) fn child(&mut self, span: Span) -> CompileResult<Scope> {
+    pub(crate) fn child(&mut self, span: Span) -> CompileResult<Scope<T>> {
         Ok(self.last(span)?.child())
     }
 
@@ -359,14 +321,14 @@ impl Scopes {
     }
 
     /// Get the local with the given name.
-    fn last(&self, span: Span) -> CompileResult<&Scope> {
+    fn last(&self, span: Span) -> CompileResult<&Scope<T>> {
         self.scopes
             .last()
             .ok_or_else(|| CompileError::msg(&span, "missing head of locals"))
     }
 
     /// Get the last locals scope.
-    fn last_mut(&mut self, span: Span) -> CompileResult<&mut Scope> {
+    fn last_mut(&mut self, span: Span) -> CompileResult<&mut Scope<T>> {
         self.scopes
             .last_mut()
             .ok_or_else(|| CompileError::msg(&span, "missing head of locals"))

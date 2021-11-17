@@ -1,11 +1,9 @@
-use crate::ast;
-use crate::ast::{Span, Spanned};
+use crate::ast::{self, Span, Spanned};
 use crate::collections::{HashMap, HashSet};
-use crate::compile::v1::{Assembler, Loop, Needs, Scope, Var};
-use crate::compile::{
-    CaptureMeta, CompileError, CompileErrorKind, CompileResult, Item, Meta, MetaKind,
-};
-use crate::parse::{Id, ParseErrorKind, Resolve};
+use crate::compile::hir::{self, Loop, Scope};
+use crate::compile::v1::{Assembler, Needs, Var};
+use crate::compile::{CaptureMeta, CompileError, CompileErrorKind, CompileResult, Meta, MetaKind};
+use crate::parse::{ParseErrorKind, Resolve};
 use crate::query::{BuiltInFormat, BuiltInTemplate};
 use crate::runtime::{
     ConstValue, Inst, InstAddress, InstAssignOp, InstOp, InstRangeLimits, InstTarget, InstValue,
@@ -371,7 +369,7 @@ fn condition(
     condition: &ast::Condition,
     c: &mut Assembler<'_>,
     then_label: Label,
-) -> CompileResult<Scope> {
+) -> CompileResult<Scope<Var>> {
     match condition {
         ast::Condition::Expr(e) => {
             let span = e.span();
@@ -426,7 +424,7 @@ fn pat_vec(
     // that it is indeed a vector.
     c.asm.push(Inst::Copy { offset }, span);
 
-    let (is_open, count) = pat_items_count(&ast.items)?;
+    let (is_open, count) = hir::pat_items_count(&ast.items)?;
 
     c.asm.push(
         Inst::MatchSequence {
@@ -481,54 +479,21 @@ fn pat_tuple(
     // interact with it multiple times.
     let offset = c.scopes.decl_anon(span)?;
 
-    let (is_open, count) = pat_items_count(&ast.items)?;
-
-    let type_check = if let Some(path) = &ast.path {
-        let named = c.convert_path(path)?;
-        let meta = c.lookup_meta(path.span(), &named.item)?;
-
-        let (args, type_check) = match meta.as_tuple() {
-            Some((args, type_check)) => (args, type_check),
-            None => {
-                return Err(CompileError::expected_meta(
-                    span,
-                    meta,
-                    "type that can be used in a tuple pattern",
-                ));
-            }
-        };
-
-        if !(args == count || count < args && is_open) {
-            return Err(CompileError::new(
-                span,
-                CompileErrorKind::UnsupportedArgumentCount {
-                    meta,
-                    expected: args,
-                    actual: count,
-                },
-            ));
-        }
-
-        c.context
-            .type_check_for(&meta.item.item)
-            .unwrap_or(type_check)
-    } else {
-        TypeCheck::Tuple
-    };
+    let pat_tuple = hir::pat_tuple(ast, c)?;
 
     c.asm.push(Inst::Copy { offset }, span);
     c.asm.push(
         Inst::MatchSequence {
-            type_check,
-            len: count,
-            exact: !is_open,
+            type_check: pat_tuple.type_check,
+            len: pat_tuple.len,
+            exact: !pat_tuple.has_rest,
         },
         span,
     );
     c.asm
         .pop_and_jump_if_not(c.scopes.local_var_count(span)?, false_label, span);
 
-    for (index, (p, _)) in ast.items.iter().take(count).enumerate() {
+    for (index, (p, _)) in ast.items.iter().take(pat_tuple.len).enumerate() {
         let span = p.span();
 
         let load = move |c: &mut Assembler<'_>, needs: Needs| {
@@ -561,124 +526,16 @@ fn pat_object(
     load(c, Needs::Value)?;
     let offset = c.scopes.decl_anon(span)?;
 
-    let mut string_slots = Vec::new();
-
-    let mut keys_dup = HashMap::new();
-    let mut keys = Vec::new();
-
-    let mut bindings = Vec::new();
-    let (has_rest, count) = pat_items_count(&ast.items)?;
-
-    for (pat, _) in ast.items.iter().take(count) {
-        let span = pat.span();
-        let cow_key;
-
-        let key = match pat {
-            ast::Pat::PatBinding(binding) => {
-                cow_key = binding.key.resolve(&c.q.storage, c.q.sources)?;
-                bindings.push(Binding::Binding(
-                    binding.span(),
-                    cow_key.as_ref().into(),
-                    &*binding.pat,
-                ));
-                cow_key.as_ref()
-            }
-            ast::Pat::PatPath(path) => {
-                let ident = match path.path.try_as_ident() {
-                    Some(ident) => ident,
-                    None => {
-                        return Err(CompileError::new(
-                            span,
-                            CompileErrorKind::UnsupportedPatternExpr,
-                        ));
-                    }
-                };
-
-                let key = ident.resolve(&c.q.storage, c.q.sources)?;
-                bindings.push(Binding::Ident(path.span(), key.into()));
-                key
-            }
-            _ => {
-                return Err(CompileError::new(
-                    span,
-                    CompileErrorKind::UnsupportedPatternExpr,
-                ));
-            }
-        };
-
-        string_slots.push(c.q.unit.new_static_string(span, key)?);
-
-        if let Some(existing) = keys_dup.insert(key.to_string(), span) {
-            return Err(CompileError::new(
-                span,
-                CompileErrorKind::DuplicateObjectKey {
-                    existing,
-                    object: ast.span(),
-                },
-            ));
-        }
-
-        keys.push(key.to_string());
-    }
-
-    let keys = c.q.unit.new_static_object_keys_iter(span, &keys[..])?;
-
-    let type_check = match &ast.ident {
-        ast::ObjectIdent::Named(path) => {
-            let span = path.span();
-
-            let named = c.convert_path(path)?;
-            let meta = c.lookup_meta(span, &named.item)?;
-
-            let (object, type_check) = match &meta.kind {
-                MetaKind::Struct {
-                    object, type_hash, ..
-                } => {
-                    let type_check = TypeCheck::Type(*type_hash);
-                    (object, type_check)
-                }
-                MetaKind::StructVariant {
-                    object, type_hash, ..
-                } => {
-                    let type_check = TypeCheck::Variant(*type_hash);
-                    (object, type_check)
-                }
-                _ => {
-                    return Err(CompileError::expected_meta(
-                        span,
-                        meta,
-                        "type that can be used in an object pattern",
-                    ));
-                }
-            };
-
-            let fields = &object.fields;
-
-            for binding in &bindings {
-                if !fields.contains(binding.key()) {
-                    return Err(CompileError::new(
-                        span,
-                        CompileErrorKind::LitObjectNotField {
-                            field: binding.key().into(),
-                            item: meta.item.item.clone(),
-                        },
-                    ));
-                }
-            }
-
-            type_check
-        }
-        ast::ObjectIdent::Anonymous(..) => TypeCheck::Object,
-    };
+    let pat_object = hir::pat_object(ast, c)?;
 
     // Copy the temporary and check that its length matches the pattern and
     // that it is indeed a vector.
     c.asm.push(Inst::Copy { offset }, span);
     c.asm.push(
         Inst::MatchObject {
-            type_check,
-            slot: keys,
-            exact: !has_rest,
+            type_check: pat_object.type_check,
+            slot: pat_object.keys,
+            exact: !pat_object.has_rest,
         },
         span,
     );
@@ -686,11 +543,15 @@ fn pat_object(
     c.asm
         .pop_and_jump_if_not(c.scopes.local_var_count(span)?, false_label, span);
 
-    for (binding, slot) in bindings.iter().zip(string_slots) {
+    for (binding, slot) in pat_object
+        .bindings
+        .iter()
+        .zip(pat_object.string_slots.iter().copied())
+    {
         let span = binding.span();
 
         match binding {
-            Binding::Binding(_, _, p) => {
+            hir::Binding::Binding(_, _, p) => {
                 let load = move |c: &mut Assembler<'_>, needs: Needs| {
                     if needs.value() {
                         c.asm.push(Inst::ObjectIndexGetAt { offset, slot }, span);
@@ -701,35 +562,14 @@ fn pat_object(
 
                 pat(p, c, false_label, &load)?;
             }
-            Binding::Ident(_, key) => {
+            hir::Binding::Ident(_, key) => {
                 c.asm.push(Inst::ObjectIndexGetAt { offset, slot }, span);
                 c.scopes.decl_var(key, span)?;
             }
         }
     }
 
-    return Ok(());
-
-    enum Binding<'a> {
-        Binding(Span, Box<str>, &'a ast::Pat),
-        Ident(Span, Box<str>),
-    }
-
-    impl Binding<'_> {
-        fn span(&self) -> Span {
-            match self {
-                Self::Binding(span, _, _) => *span,
-                Self::Ident(span, _) => *span,
-            }
-        }
-
-        fn key(&self) -> &str {
-            match self {
-                Self::Binding(_, key, _) => key.as_ref(),
-                Self::Ident(_, key) => key.as_ref(),
-            }
-        }
-    }
+    Ok(())
 }
 
 /// Compile a binding name that matches a known meta type.
@@ -1143,84 +983,56 @@ fn expr(ast: &ast::Expr, c: &mut Assembler<'_>, needs: Needs) -> CompileResult<A
 fn expr_assign(ast: &ast::ExprAssign, c: &mut Assembler<'_>, needs: Needs) -> CompileResult<Asm> {
     let span = ast.span();
 
-    let supported = match &ast.lhs {
-        // <var> = <value>
-        ast::Expr::Path(path) if path.rest.is_empty() => {
+    match hir::expr_assign_target(ast)? {
+        hir::AssignTarget::Ident(ident) => {
             expr(&ast.rhs, c, Needs::Value)?.apply(c)?;
-
-            let segment = path
-                .first
-                .try_as_ident()
-                .ok_or_else(|| CompileError::msg(path, "unsupported path"))?;
-            let ident = segment.resolve(&c.q.storage, c.q.sources)?;
+            let ident = ident.resolve(&c.q.storage, c.q.sources)?;
             let var = c.scopes.get_var(c.q.visitor, &*ident, c.source_id, span)?;
             c.asm.push(Inst::Replace { offset: var.offset }, span);
-            true
         }
-        // <expr>.<field> = <value>
-        ast::Expr::FieldAccess(field_access) => {
-            let span = field_access.span();
+        hir::AssignTarget::ObjectField(e, ident) => {
+            let slot = ident.resolve(&c.q.storage, c.q.sources)?;
+            let slot = c.q.unit.new_static_string(ident.span(), slot.as_ref())?;
 
-            // field assignment
-            match &field_access.expr_field {
-                ast::ExprField::Path(path) => {
-                    if let Some(ident) = path.try_as_ident() {
-                        let slot = ident.resolve(&c.q.storage, c.q.sources)?;
-                        let slot = c.q.unit.new_static_string(ident.span(), slot.as_ref())?;
+            expr(&ast.rhs, c, Needs::Value)?.apply(c)?;
+            c.scopes.decl_anon(ast.rhs.span())?;
 
-                        expr(&ast.rhs, c, Needs::Value)?.apply(c)?;
-                        c.scopes.decl_anon(ast.rhs.span())?;
+            expr(e, c, Needs::Value)?.apply(c)?;
+            c.scopes.decl_anon(span)?;
 
-                        expr(&field_access.expr, c, Needs::Value)?.apply(c)?;
-                        c.scopes.decl_anon(span)?;
-
-                        c.asm.push(Inst::ObjectIndexSet { slot }, span);
-                        c.scopes.undecl_anon(span, 2)?;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                ast::ExprField::LitNumber(field) => {
-                    let number = field.resolve(c.q.storage(), c.q.sources)?;
-                    let index = number.as_tuple_index().ok_or_else(|| {
-                        CompileError::new(span, CompileErrorKind::UnsupportedTupleIndex { number })
-                    })?;
-
-                    expr(&ast.rhs, c, Needs::Value)?.apply(c)?;
-                    c.scopes.decl_anon(ast.rhs.span())?;
-
-                    expr(&field_access.expr, c, Needs::Value)?.apply(c)?;
-                    c.asm.push(Inst::TupleIndexSet { index }, span);
-                    c.scopes.undecl_anon(span, 1)?;
-                    true
-                }
-            }
+            c.asm.push(Inst::ObjectIndexSet { slot }, span);
+            c.scopes.undecl_anon(span, 2)?;
         }
-        ast::Expr::Index(expr_index_get) => {
-            let span = expr_index_get.span();
+        hir::AssignTarget::TupleField(e, field) => {
+            let number = field.resolve(c.q.storage(), c.q.sources)?;
+            let index = number.as_tuple_index().ok_or_else(|| {
+                CompileError::new(span, CompileErrorKind::UnsupportedTupleIndex { number })
+            })?;
+
+            expr(&ast.rhs, c, Needs::Value)?.apply(c)?;
+            c.scopes.decl_anon(ast.rhs.span())?;
+
+            expr(e, c, Needs::Value)?.apply(c)?;
+            c.scopes.decl_anon(span)?;
+
+            c.asm.push(Inst::TupleIndexSet { index }, span);
+            c.scopes.undecl_anon(span, 2)?;
+        }
+        hir::AssignTarget::ExprIndex(e) => {
+            let span = e.span();
 
             expr(&ast.rhs, c, Needs::Value)?.apply(c)?;
             c.scopes.decl_anon(span)?;
 
-            expr(&expr_index_get.target, c, Needs::Value)?.apply(c)?;
+            expr(&e.target, c, Needs::Value)?.apply(c)?;
             c.scopes.decl_anon(span)?;
 
-            expr(&expr_index_get.index, c, Needs::Value)?.apply(c)?;
+            expr(&e.index, c, Needs::Value)?.apply(c)?;
             c.scopes.decl_anon(span)?;
 
             c.asm.push(Inst::IndexSet, span);
             c.scopes.undecl_anon(span, 3)?;
-            true
         }
-        _ => false,
-    };
-
-    if !supported {
-        return Err(CompileError::new(
-            span,
-            CompileErrorKind::UnsupportedAssignExpr,
-        ));
     }
 
     if needs.value() {
@@ -1575,139 +1387,17 @@ fn expr_break(ast: &ast::ExprBreak, c: &mut Assembler<'_>, _: Needs) -> CompileR
     Ok(Asm::top(span))
 }
 
-enum Call {
-    Var {
-        /// The variable slot being called.
-        var: Var,
-        /// The name of the variable being called.
-        name: Box<str>,
-    },
-    Instance {
-        /// Hash of the fn being called.
-        hash: Hash,
-    },
-    Meta {
-        /// Meta being called.
-        meta: Meta,
-        /// The hash of the meta thing being called.
-        hash: Hash,
-    },
-    /// An expression being called.
-    Expr,
-    /// A constant function call.
-    ConstFn {
-        /// Meta of the constand function.
-        meta: Meta,
-        /// The identifier of the constant function.
-        id: Id,
-    },
-}
-
-/// Convert into a call expression.
-fn convert_expr_call(ast: &ast::ExprCall, c: &mut Assembler<'_>) -> CompileResult<Call> {
-    let span = ast.span();
-
-    match &ast.expr {
-        ast::Expr::Path(path) => {
-            let named = c.convert_path(path)?;
-
-            if let Some(name) = named.as_local() {
-                let local = c
-                    .scopes
-                    .try_get_var(c.q.visitor, name, c.source_id, path.span())?;
-
-                if let Some(var) = local {
-                    return Ok(Call::Var {
-                        var,
-                        name: name.into(),
-                    });
-                }
-            }
-
-            let meta = c.lookup_meta(path.span(), &named.item)?;
-
-            match &meta.kind {
-                MetaKind::UnitStruct { .. } | MetaKind::UnitVariant { .. } => {
-                    if !ast.args.is_empty() {
-                        return Err(CompileError::new(
-                            span,
-                            CompileErrorKind::UnsupportedArgumentCount {
-                                meta: meta.clone(),
-                                expected: 0,
-                                actual: ast.args.len(),
-                            },
-                        ));
-                    }
-                }
-                MetaKind::TupleStruct { tuple, .. } | MetaKind::TupleVariant { tuple, .. } => {
-                    if tuple.args != ast.args.len() {
-                        return Err(CompileError::new(
-                            span,
-                            CompileErrorKind::UnsupportedArgumentCount {
-                                meta: meta.clone(),
-                                expected: tuple.args,
-                                actual: ast.args.len(),
-                            },
-                        ));
-                    }
-
-                    if tuple.args == 0 {
-                        let tuple = path.span();
-                        c.diagnostics.remove_tuple_call_parens(
-                            c.source_id,
-                            span,
-                            tuple,
-                            c.context(),
-                        );
-                    }
-                }
-                MetaKind::Function { .. } => (),
-                MetaKind::ConstFn { id, .. } => {
-                    let id = *id;
-                    return Ok(Call::ConstFn { meta, id });
-                }
-                _ => {
-                    return Err(CompileError::expected_meta(
-                        span,
-                        meta,
-                        "something that can be called as a function",
-                    ));
-                }
-            };
-
-            let hash = Hash::type_hash(&meta.item.item);
-            return Ok(Call::Meta { meta, hash });
-        }
-        ast::Expr::FieldAccess(access) => {
-            if let ast::ExprFieldAccess {
-                expr_field: ast::ExprField::Path(path),
-                ..
-            } = &**access
-            {
-                if let Some(ident) = path.try_as_ident() {
-                    let ident = ident.resolve(c.q.storage(), c.q.sources)?;
-                    let hash = Hash::instance_fn_name(ident);
-                    return Ok(Call::Instance { hash });
-                }
-            }
-        }
-        _ => {}
-    };
-
-    Ok(Call::Expr)
-}
-
 /// Assemble a call expression.
 #[instrument]
 fn expr_call(ast: &ast::ExprCall, c: &mut Assembler<'_>, needs: Needs) -> CompileResult<Asm> {
     let span = ast.span();
 
-    let call = convert_expr_call(ast, c)?;
+    let call = hir::expr_call(ast, c)?;
 
     let args = ast.args.len();
 
     match call {
-        Call::Var { var, name } => {
+        hir::Call::Var { var, name } => {
             for (e, _) in &ast.args {
                 expr(e, c, Needs::Value)?.apply(c)?;
                 c.scopes.decl_anon(span)?;
@@ -1720,7 +1410,7 @@ fn expr_call(ast: &ast::ExprCall, c: &mut Assembler<'_>, needs: Needs) -> Compil
 
             c.scopes.undecl_anon(span, ast.args.len() + 1)?;
         }
-        Call::Instance { hash } => {
+        hir::Call::Instance { hash } => {
             let target = ast.target();
 
             expr(target, c, Needs::Value)?.apply(c)?;
@@ -1734,7 +1424,7 @@ fn expr_call(ast: &ast::ExprCall, c: &mut Assembler<'_>, needs: Needs) -> Compil
             c.asm.push(Inst::CallInstance { hash, args }, span);
             c.scopes.undecl_anon(span, ast.args.len() + 1)?;
         }
-        Call::Meta { meta, hash } => {
+        hir::Call::Meta { meta, hash } => {
             for (e, _) in &ast.args {
                 expr(e, c, Needs::Value)?.apply(c)?;
                 c.scopes.decl_anon(span)?;
@@ -1745,7 +1435,7 @@ fn expr_call(ast: &ast::ExprCall, c: &mut Assembler<'_>, needs: Needs) -> Compil
 
             c.scopes.undecl_anon(span, args)?;
         }
-        Call::Expr => {
+        hir::Call::Expr => {
             for (e, _) in &ast.args {
                 expr(e, c, Needs::Value)?.apply(c)?;
                 c.scopes.decl_anon(span)?;
@@ -1758,7 +1448,7 @@ fn expr_call(ast: &ast::ExprCall, c: &mut Assembler<'_>, needs: Needs) -> Compil
 
             c.scopes.undecl_anon(span, args + 1)?;
         }
-        Call::ConstFn { meta, id } => {
+        hir::Call::ConstFn { meta, id } => {
             let from = c.q.item_for(ast)?;
             let const_fn = c.q.const_fn_for((ast.span(), id))?;
             let value = c.call_const_fn(ast, &meta, &from, &const_fn, ast.args.as_slice())?;
@@ -2479,19 +2169,19 @@ fn expr_object(ast: &ast::ExprObject, c: &mut Assembler<'_>, needs: Needs) -> Co
 
             match &meta.kind {
                 MetaKind::UnitStruct { .. } => {
-                    check_object_fields(&HashSet::new(), check_keys, span, &meta.item.item)?;
+                    hir::check_object_fields(&HashSet::new(), check_keys, span, &meta.item.item)?;
 
                     let hash = Hash::type_hash(&meta.item.item);
                     c.asm.push(Inst::UnitStruct { hash }, span);
                 }
                 MetaKind::Struct { object, .. } => {
-                    check_object_fields(&object.fields, check_keys, span, &meta.item.item)?;
+                    hir::check_object_fields(&object.fields, check_keys, span, &meta.item.item)?;
 
                     let hash = Hash::type_hash(&meta.item.item);
                     c.asm.push(Inst::Struct { hash, slot }, span);
                 }
                 MetaKind::StructVariant { object, .. } => {
-                    check_object_fields(&object.fields, check_keys, span, &meta.item.item)?;
+                    hir::check_object_fields(&object.fields, check_keys, span, &meta.item.item)?;
 
                     let hash = Hash::type_hash(&meta.item.item);
                     c.asm.push(Inst::StructVariant { hash, slot }, span);
@@ -2516,40 +2206,7 @@ fn expr_object(ast: &ast::ExprObject, c: &mut Assembler<'_>, needs: Needs) -> Co
     }
 
     c.scopes.pop(guard, span)?;
-    return Ok(Asm::top(span));
-
-    fn check_object_fields(
-        fields: &HashSet<Box<str>>,
-        check_keys: Vec<(Box<str>, Span)>,
-        span: Span,
-        item: &Item,
-    ) -> CompileResult<()> {
-        let mut fields = fields.clone();
-
-        for (field, span) in check_keys {
-            if !fields.remove(&field) {
-                return Err(CompileError::new(
-                    span,
-                    CompileErrorKind::LitObjectNotField {
-                        field,
-                        item: item.clone(),
-                    },
-                ));
-            }
-        }
-
-        if let Some(field) = fields.into_iter().next() {
-            return Err(CompileError::new(
-                span,
-                CompileErrorKind::LitObjectMissingField {
-                    field,
-                    item: item.clone(),
-                },
-            ));
-        }
-
-        Ok(())
-    }
+    Ok(Asm::top(span))
 }
 
 /// Assemble a path.
@@ -2557,53 +2214,22 @@ fn expr_object(ast: &ast::ExprObject, c: &mut Assembler<'_>, needs: Needs) -> Co
 fn path(ast: &ast::Path, c: &mut Assembler<'_>, needs: Needs) -> CompileResult<Asm> {
     let span = ast.span();
 
-    if let Some(ast::PathKind::SelfValue) = ast.as_kind() {
-        let var = c.scopes.get_var(c.q.visitor, SELF, c.source_id, span)?;
+    match hir::path(ast, c, matches!(needs, Needs::Value))? {
+        hir::Path::SelfValue => {
+            let var = c.scopes.get_var(c.q.visitor, SELF, c.source_id, span)?;
 
-        if needs.value() {
-            var.copy(c, span, SELF);
-        }
-
-        return Ok(Asm::top(span));
-    }
-
-    let named = c.convert_path(ast)?;
-
-    if let Needs::Value = needs {
-        if let Some(local) = named.as_local() {
-            if let Some(var) = c
-                .scopes
-                .try_get_var(c.q.visitor, local, c.source_id, span)?
-            {
-                return Ok(Asm::var(span, var, local.into()));
+            if needs.value() {
+                var.copy(c, span, SELF);
             }
+
+            Ok(Asm::top(span))
+        }
+        hir::Path::Var(var, name) => Ok(Asm::var(span, var, name)),
+        hir::Path::Meta(m) => {
+            meta(span, c, &m, needs)?;
+            Ok(Asm::top(span))
         }
     }
-
-    if let Some(m) = c.try_lookup_meta(span, &named.item)? {
-        meta(span, c, &m, needs)?;
-        return Ok(Asm::top(span));
-    }
-
-    if let (Needs::Value, Some(local)) = (needs, named.as_local()) {
-        // light heuristics, treat it as a type error in case the
-        // first character is uppercase.
-        if !local.starts_with(char::is_uppercase) {
-            return Err(CompileError::new(
-                span,
-                CompileErrorKind::MissingLocal {
-                    name: local.to_owned(),
-                },
-            ));
-        }
-    };
-
-    Err(CompileError::new(
-        span,
-        CompileErrorKind::MissingItem {
-            item: named.item.clone(),
-        },
-    ))
 }
 
 /// Assemble a range expression.
@@ -3239,37 +2865,4 @@ fn local(ast: &ast::Local, c: &mut Assembler<'_>, needs: Needs) -> CompileResult
     }
 
     Ok(Asm::top(span))
-}
-
-/// Test if the given pattern is open or not.
-fn pat_items_count<'a, I: 'a, U: 'a>(items: I) -> Result<(bool, usize), CompileError>
-where
-    I: IntoIterator<Item = &'a (ast::Pat, U)>,
-    I::IntoIter: DoubleEndedIterator,
-{
-    let mut it = items.into_iter();
-
-    let (is_open, mut count) = match it.next_back() {
-        Some((pat, _)) => {
-            if matches!(pat, ast::Pat::PatRest(..)) {
-                (true, 0)
-            } else {
-                (false, 1)
-            }
-        }
-        None => return Ok((false, 0)),
-    };
-
-    for (pat, _) in it {
-        if let ast::Pat::PatRest(rest) = pat {
-            return Err(CompileError::new(
-                rest,
-                CompileErrorKind::UnsupportedPatternRest,
-            ));
-        }
-
-        count += 1;
-    }
-
-    Ok((is_open, count))
 }

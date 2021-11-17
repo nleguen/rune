@@ -25,6 +25,8 @@ pub(crate) use self::compile_visitor::NoopCompileVisitor;
 pub(crate) mod context;
 pub use self::context::{Context, ContextError, ContextSignature, ContextTypeInfo};
 
+pub(crate) mod hir;
+
 pub(crate) mod ir;
 pub(crate) use self::ir::{IrBudget, IrCompile, IrCompiler, IrEval, IrEvalOutcome, IrInterpreter};
 pub use self::ir::{IrError, IrErrorKind, IrValue};
@@ -169,9 +171,9 @@ impl CompileBuildEntry<'_> {
             context: self.context,
             q: self.q.borrow(),
             asm,
-            scopes: self::v1::Scopes::new(),
+            scopes: hir::Scopes::new(),
             contexts: vec![span],
-            loops: self::v1::Loops::new(),
+            loops: hir::Loops::new(),
             options: self.options,
             diagnostics: self.diagnostics,
         }
