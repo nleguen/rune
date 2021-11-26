@@ -279,7 +279,8 @@ impl Expr {
         let expr = Self::parse_chain(p, expr, callable)?;
 
         let expr = if *eager_binary {
-            Self::parse_binary(p, expr, 0, eager_brace)?
+            let op = ast::BinOp::from_peeker(p.peeker());
+            Self::parse_binary(p, expr, op, eager_brace)?
         } else {
             expr
         };
@@ -626,16 +627,13 @@ impl Expr {
         p: &mut Parser<'_>,
         lhs: &Self,
         eager_brace: EagerBrace,
-        op: ast::BinOp,
-        lookahead_tok: &mut Option<ast::BinOp>,
+        mut op: Option<ast::BinOp>,
     ) -> Result<Self, ParseError> {
         let rhs = Self::parse_base(p, &mut vec![], eager_brace)?;
         let mut rhs = Self::parse_chain(p, rhs, Callable(true))?;
 
-        *lookahead_tok = ast::BinOp::from_peeker(p.peeker());
-
         loop {
-            let lh = match *lookahead_tok {
+            let lh = match op.take() {
                 Some(lh) if lh.precedence() > op.precedence() => lh,
                 Some(lh) if lh.precedence() == op.precedence() && !op.is_assoc() => {
                     return Err(ParseError::new(
@@ -646,8 +644,8 @@ impl Expr {
                 _ => break,
             };
 
-            rhs = Self::parse_binary(p, rhs, lh.precedence(), eager_brace)?;
-            *lookahead_tok = ast::BinOp::from_peeker(p.peeker());
+            rhs = Self::parse_binary(p, rhs, Some(lh), eager_brace)?;
+            op = ast::BinOp::from_peeker(p.peeker());
         }
 
         Ok(rhs)
@@ -659,7 +657,7 @@ impl Expr {
         lhs: &Self,
         eager_brace: EagerBrace,
         op: ast::BinOp,
-        lookahead_tok: &mut Option<ast::BinOp>,
+        lookahead_op: &mut Option<ast::BinOp>,
     ) -> Result<Option<Self>, ParseError> {
         Ok(if Self::peek(p.peeker()) {
             Some(Self::parse_binary_rhs(
@@ -667,10 +665,10 @@ impl Expr {
                 lhs,
                 eager_brace,
                 op,
-                lookahead_tok,
+                lookahead_op,
             )?)
         } else {
-            *lookahead_tok = None;
+            *lookahead_op = None;
             None
         })
     }
@@ -679,56 +677,41 @@ impl Expr {
     fn parse_binary(
         p: &mut Parser<'_>,
         mut lhs: Self,
-        min_precedence: usize,
+        mut op: Option<ast::BinOp>,
         eager_brace: EagerBrace,
     ) -> Result<Self, ParseError> {
-        let mut lookahead_tok = ast::BinOp::from_peeker(p.peeker());
+        while let Some(o) = op.take() {
+            o.advance(p)?;
 
-        loop {
-            let op = match lookahead_tok {
-                Some(op) if op.precedence() >= min_precedence => op,
-                _ => break,
-            };
-
-            let (t1, t2) = op.advance(p)?;
-
-            lhs = match t1.kind {
-                K![..] => {
-                    let to =
-                        Self::try_parse_binary_rhs(p, &lhs, eager_brace, op, &mut lookahead_tok)?;
+            lhs = match o {
+                ast::BinOp::DotDot(token) => {
+                    let to = Self::try_parse_binary_rhs(p, &lhs, eager_brace, o, &mut op)?;
 
                     Self::Range(Box::new(ast::ExprRange {
                         attributes: lhs.take_attributes(),
                         from: Some(lhs),
-                        limits: ast::ExprRangeLimits::HalfOpen(ast::generated::DotDot {
-                            token: t1,
-                        }),
+                        limits: ast::ExprRangeLimits::HalfOpen(token),
                         to,
                     }))
                 }
-                K![..=] => {
-                    let to =
-                        Self::try_parse_binary_rhs(p, &lhs, eager_brace, op, &mut lookahead_tok)?;
+                ast::BinOp::DotDotEq(token) => {
+                    let to = Self::try_parse_binary_rhs(p, &lhs, eager_brace, o, &mut op)?;
 
                     Self::Range(Box::new(ast::ExprRange {
                         attributes: lhs.take_attributes(),
                         from: Some(lhs),
-                        limits: ast::ExprRangeLimits::Closed(ast::generated::DotDotEq {
-                            token: t1,
-                        }),
+                        limits: ast::ExprRangeLimits::Closed(token),
                         to,
                     }))
                 }
-                _ => {
-                    let rhs = Self::parse_binary_rhs(p, &lhs, eager_brace, op, &mut lookahead_tok)?;
+                op => {
+                    let rhs = Self::parse_binary_rhs(p, &lhs, eager_brace, op)?;
 
                     Self::Binary(Box::new(ast::ExprBinary {
                         attributes: Vec::new(),
                         lhs,
-                        t1,
-                        t2,
-                        rhs,
                         op,
+                        rhs,
                     }))
                 }
             };

@@ -56,7 +56,8 @@ use crate::parse::{Parse, ParseError, Parser, Peek};
 
 #[macro_use]
 /// Generated modules.
-pub mod generated;
+mod generated;
+pub use self::generated::*;
 
 macro_rules! expr_parse {
     ($ty:ident, $local:ty, $expected:literal) => {
@@ -189,7 +190,6 @@ pub use self::expr_yield::ExprYield;
 pub use self::file::File;
 pub use self::fn_arg::FnArg;
 pub use self::force_semi::ForceSemi;
-pub use self::generated::Kind;
 pub use self::grouped::{AngleBracketed, Braced, Bracketed, Parenthesized};
 pub use self::ident::Ident;
 pub use self::item::Item;
