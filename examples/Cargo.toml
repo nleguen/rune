@@ -10,7 +10,8 @@ full = ["rune-modules/full"]
 default = ["full"]
 
 [dependencies]
-tokio = { version = "1.14.0", features = ["macros"] }
+tokio = { version = "1.14", features = ["rt", "rt-multi-thread", "time", "parking_lot", "macros"] }
 
 rune = {path = "../crates/rune"}
 rune-modules = {path = "../crates/rune-modules"}
+anyhow = "1.0.51"
